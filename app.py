@@ -13,7 +13,7 @@ import seaborn as sns
 from datetime import datetime, timedelta
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from statsmodels.tsa.statespace.sarimax import SARIMAX
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 # Suppress warnings
 import warnings
 warnings.filterwarnings("ignore")
@@ -117,8 +117,8 @@ class CustomLinearRegression:
 
     def fit(self, X, y):
         X_b = np.column_stack([X, np.ones(X.shape[0])])  # Add intercept
-        I = np.eye(X_b.shape[1])  # Identity matrix for regularization
-        I[-1, -1] = 0  # Do not regularize intercept
+        I = np.eye(X_b.shape[1])
+        I[-1, -1] = 0
 
         try:
             theta = np.linalg.inv(X_b.T @ X_b + self.alpha * I) @ X_b.T @ y
@@ -1053,6 +1053,17 @@ def plot_forecast(train_data, test_data, predictions, title='Forecast'):
 def run_car_sales_prediction():
     st.header("Car Sales Prediction")
 
+    # Sidebar Configuration
+    with st.sidebar:
+        st.title("Model Parameters")
+
+        # ARIMA Parameters
+        st.subheader("ARIMA Parameters")
+        p = 5
+        d = 2
+        q = 0
+        months_ahead = st.slider("Prediction Months", 1, 12, 3)
+
     # Create or upload data
     data = create_sample_dataset()
     uploaded_file = st.file_uploader("Upload your car sales data file", type=["csv", "xlsx", "xls"])
@@ -1075,38 +1086,144 @@ def run_car_sales_prediction():
     st.subheader("Data Preview")
     st.dataframe(data.head())
 
-    # Preprocess and Predict
+    # Initialize predictor with selected parameters
     predictor = CarSalesPredictor()
+
+    # Update ARIMA initialization in the fit method
+    model_metrics = {}
+    for car in data['car_model'].unique():
+        car_data = data[data['car_model'] == car]['sales'].values
+        if len(car_data) > 2:
+            arima = CustomARIMA(p=p, d=d, q=q)
+            arima.fit(car_data)
+            predictor.arima_models[car] = arima
+
+            # Calculate model metrics
+            predictions = arima.predict(len(car_data))
+            model_metrics[car] = {
+                'MAE': mean_absolute_error(car_data, predictions),
+            }
+
     predictor.fit(data)
+    predictions = predictor.predict(data, months_ahead=months_ahead)
 
-    predictions = predictor.predict(data, months_ahead=3)
+    # Real-time Prediction Interface
+    st.subheader("Quick Prediction Tool")
+    col1, col2, col3 = st.columns(3)
 
-    # Display predictions in Streamlit
-    st.write("### Predicted Sales for Next 3 Months:")
-    for car, pred in predictions.items():
-        st.write(f"**{car}:** {', '.join([f'{int(sale)} units' for sale in pred])}")
+    with col1:
+        selected_car = st.selectbox("Select Car Model", data['car_model'].unique())
+        price = st.number_input("Price (in lakhs)", min_value=0.0, max_value=50.0, value=8.0)
 
-    # Example: Plotting for each car model
-    st.write("### Historical vs Predicted Sales (By Car Model)")
+    with col2:
+        marketing_spend = st.number_input("Marketing Spend (in lakhs)", min_value=0.0, max_value=200.0, value=75.0)
+        festival_season = st.selectbox("Festival Season", [0, 1])
+
+    with col3:
+        competitor_launches = st.number_input("Competitor Launches", min_value=0, max_value=10, value=1)
+        prediction_month = st.slider("Prediction Month", 1, 12, datetime.now().month)
+
+    if st.button("Generate Quick Prediction"):
+        features = np.array([price, marketing_spend, festival_season, competitor_launches, prediction_month])
+        if selected_car in predictor.lr_models:
+            quick_pred = predictor.lr_models[selected_car].predict(features.reshape(1, -1))
+            st.success(f"Predicted sales for {selected_car}: {int(quick_pred[0])} units")
+
+    # Display model metrics for selected car
+    st.subheader("Model Performance Metrics")
+    if selected_car in model_metrics:
+        metrics_df = pd.DataFrame({
+            'Metric': list(model_metrics[selected_car].keys()),
+            'Value': [f"{value:.4f}" for value in model_metrics[selected_car].values()]
+        })
+        st.dataframe(metrics_df)
+
+    # Interactive Visualizations
+    st.subheader("Sales Analysis and Predictions")
+
+    # 1. Historical vs Predicted Sales (Interactive)
     for car, pred in predictions.items():
         car_data = data[data['car_model'] == car]
         if car_data.empty:
-            st.warning(f"No data available for {car}.")
             continue
-        future_dates = [car_data['date'].iloc[-1] + timedelta(days=30 * i) for i in range(1, len(pred)+1)]
-        
-        fig, ax = plt.subplots(figsize=(10, 6))
-        ax.plot(car_data['date'], car_data['sales'], label='Historical', marker='o')
-        ax.plot(future_dates, pred, label='Predicted', linestyle='--', marker='s')
-        ax.set_title(f'{car} - Historical vs Predicted Sales')
-        ax.set_xlabel('Date')
-        ax.set_ylabel('Sales (units)')
-        ax.legend()
-        ax.grid(True)
-        plt.xticks(rotation=45)
-        plt.tight_layout()
-        st.pyplot(fig)
 
+        future_dates = [car_data['date'].iloc[-1] + timedelta(days=30 * i) for i in range(1, len(pred) + 1)]
+
+        # Create interactive plot using Plotly
+        fig = go.Figure()
+
+        # Historical data
+        fig.add_trace(go.Scatter(
+            x=car_data['date'],
+            y=car_data['sales'],
+            name='Historical',
+            mode='lines+markers'
+        ))
+
+        # Predicted data
+        fig.add_trace(go.Scatter(
+            x=future_dates,
+            y=pred,
+            name='Predicted',
+            mode='lines+markers',
+            line=dict(dash='dash')
+        ))
+
+        fig.update_layout(
+            title=f'{car} - Historical vs Predicted Sales',
+            xaxis_title='Date',
+            yaxis_title='Sales (units)',
+            hovermode='x unified',
+            showlegend=True
+        )
+
+        st.plotly_chart(fig)
+
+    # 2. Sales Seasonality Analysis
+    st.subheader("Seasonality Analysis")
+
+    car_data_seasonal = data.copy()
+    car_data_seasonal['month'] = pd.to_datetime(car_data_seasonal['date']).dt.month
+
+    fig_seasonal = px.box(car_data_seasonal, x='month', y='sales', color='car_model',
+                          title='Monthly Sales Distribution by Car Model')
+    fig_seasonal.update_layout(xaxis_title='Month', yaxis_title='Sales (units)')
+    st.plotly_chart(fig_seasonal)
+
+    # 3. Sales Correlation Matrix
+    st.subheader("Feature Correlation Analysis")
+
+    correlation_data = data[['sales', 'price', 'marketing_spend', 'festival_season', 'competitor_launches']]
+    correlation_matrix = correlation_data.corr()
+
+    fig_corr = px.imshow(correlation_matrix,
+                         labels=dict(color="Correlation"),
+                         x=correlation_matrix.columns,
+                         y=correlation_matrix.columns)
+    fig_corr.update_layout(title='Feature Correlation Matrix')
+    st.plotly_chart(fig_corr)
+
+    # 4. Marketing Spend vs Sales Scatter Plot
+    st.subheader("Marketing Spend vs Sales Analysis")
+
+    fig_scatter = px.scatter(data, x='marketing_spend', y='sales', color='car_model',
+                             trendline="ols", title='Marketing Spend vs Sales by Car Model')
+    fig_scatter.update_layout(xaxis_title='Marketing Spend (lakhs)',
+                              yaxis_title='Sales (units)')
+    st.plotly_chart(fig_scatter)
+
+    # 5. Year-over-Year Comparison
+    st.subheader("Year-over-Year Comparison")
+
+    yearly_data = data.copy()
+    yearly_data['year'] = pd.to_datetime(yearly_data['date']).dt.year
+    yearly_sales = yearly_data.groupby(['year', 'car_model'])['sales'].sum().reset_index()
+
+    fig_yoy = px.bar(yearly_sales, x='year', y='sales', color='car_model',
+                     title='Yearly Sales Comparison by Car Model',
+                     barmode='group')
+    fig_yoy.update_layout(xaxis_title='Year', yaxis_title='Total Sales (units)')
+    st.plotly_chart(fig_yoy)
 # ------------------------ #
 # **Run the Main Application**
 # ------------------------ #
